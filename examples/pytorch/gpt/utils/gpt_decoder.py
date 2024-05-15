@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
+import math, time
 from abc import abstractmethod
 from pathlib import Path
-from typing import List, Literal, Optional, Union
+from typing import List, Optional, Union
+try:
+    from typing import Literal # py 3.8 or later
+except ImportError:
+    from typing_extensions import Literal
 import os
 
 import numpy as np
@@ -665,7 +669,8 @@ class GptDecoder(FtModuleBase):
                 total_padding_tokens: torch.IntTensor,
                 masked_tokens: torch.BoolTensor,
                 cache_indirection: Optional[torch.IntTensor] = None,
-                linear_bias_slopes: Optional[torch.Tensor] = None):
+                linear_bias_slopes: Optional[torch.Tensor] = None,
+                token_nums_per_sample: Optional[torch.Tensor] = None):
         """
 
         # Args.
@@ -693,7 +698,7 @@ class GptDecoder(FtModuleBase):
         """
 
         self._initialize_model()
-
+        assert token_nums_per_sample is not None
         outputs = self.ft_op.forward(max_input_length,
                                      step,
                                      ite,
@@ -705,7 +710,9 @@ class GptDecoder(FtModuleBase):
                                      key_cache,
                                      value_cache,
                                      cache_indirection,
-                                     linear_bias_slopes)
+                                     linear_bias_slopes,
+                                     token_nums_per_sample,
+                                     token_nums_per_sample.max().item())
         return outputs[0]
 
 
@@ -1167,6 +1174,8 @@ class Gpt:
             (max_seq_length, batch_size * beam_width), dtype=torch.int32, device=device)
         output_token_ids[:max_input_length, ...] = input_token_ids.T
 
+        torch.cuda.synchronize()
+        start_time = time.time()*1000
         if comm.is_pipeline_group_first():
             # Prepare input tensors of decoder.
             input_embeds = self.word_embedding(input_token_ids)
@@ -1203,12 +1212,20 @@ class Gpt:
             compact_index=compact_to_batch)
         profiler.stop('ft-context-decoder')
 
+        torch.cuda.synchronize()
+        context_time = time.time()*1000
+        wall_time_list = [context_time-start_time]
+
+        token_nums_per_sample = torch.ones((batch_size), dtype=torch.int32, device=input_embeds.device)
+        inference_steps = torch.zeros(batch_size, dtype=torch.int32, device=device)
         for step in range(max_input_length, max_seq_length):
+            inference_steps += (1-finished.int())
             src_indir_idx = (step - max_input_length) % 2
             tgt_indir_idx = 1 - src_indir_idx
 
             is_generation_done = torch.tensor([True], dtype=torch.bool, device=device)
             for ite in range(num_local_batches):
+                draft_start_time, draft_end_time, decoder_end_time, post_process_end_time = 0,0,0,0
                 # The indices of the current local batch-beam.
                 bbidx = range(
                     ite * local_batch_size * beam_width,
@@ -1218,7 +1235,8 @@ class Gpt:
                                  min((ite + 1) * local_batch_size, batch_size))
                     src_cache_indirection = cache_indirection[src_indir_idx, bidx, ...]
                     tgt_cache_indirection = cache_indirection[tgt_indir_idx, bidx, ...]
-
+                torch.cuda.synchronize()
+                draft_start_time = time.time()*1000
                 if step == max_input_length:
                     hidden_states = last_token_hidden_states[bbidx, ...]
                 else:
@@ -1236,10 +1254,12 @@ class Gpt:
                             dtype=self.decoder.dtype,
                             device=device)
 
+                    torch.cuda.synchronize()
+                    draft_end_time = time.time()*1000
                     profiler.start('ft-decoder')
                     hidden_states = self.decoder.forward(
                         max_input_length=max_input_length,
-                        step=step,
+                        step=0,
                         ite=ite,
                         input_embeds=input_embeds,
                         sequence_lengths=sequence_lengths[bbidx],
@@ -1248,8 +1268,11 @@ class Gpt:
                         finished=finished[bbidx],
                         total_padding_tokens=pad_lengths[bbidx],
                         cache_indirection=src_cache_indirection,
-                        masked_tokens=masked_tokens[bbidx, ...])
+                        masked_tokens=masked_tokens[bbidx, ...],
+                        token_nums_per_sample=token_nums_per_sample)
                     profiler.stop('ft-decoder')
+                torch.cuda.synchronize()
+                decoder_end_time = time.time()*1000
 
                 if comm.is_pipeline_group_last():
                     if self.post_decoder_layernorm is not None:
@@ -1297,6 +1320,12 @@ class Gpt:
                         tgt_cache_indirection)
                     profiler.stop('ft-decode')
                     is_generation_done &= should_stop
+                    torch.cuda.synchronize()
+                post_process_end_time = time.time()*1000
+                if step == max_input_length:
+                    wall_time_list.extend([decoder_end_time-draft_start_time, post_process_end_time-decoder_end_time])
+                else:
+                    wall_time_list.extend([draft_end_time-draft_start_time, decoder_end_time-draft_end_time, post_process_end_time-decoder_end_time])
 
             # Broadcast from the last pipeline node if needed.
             profiler.start('ft-bcast')
@@ -1311,17 +1340,28 @@ class Gpt:
 
             if is_generation_done or finished.all():
                 break
-
+        torch.cuda.synchronize()
+        end_time = time.time()*1000
+        for batch_idx in range(batch_size):
+            if pad_lengths[batch_idx].item() == 0:
+                continue
+            output_token_ids[input_lengths[batch_idx].item():-pad_lengths[batch_idx].item(), batch_idx] = \
+                output_token_ids[input_lengths.max().item():, batch_idx]
+            output_token_ids[-pad_lengths[batch_idx].item():, batch_idx] = eos_token_id
         # Transpose (L, batch, beam) -> (batch, beam, L)
         output_token_ids = output_token_ids.view(-1, batch_size, beam_width).permute(1, 2, 0)
 
         # Increase sequence_length by 1 because the sequence length of time step t is t - 1.
         sequence_lengths += 1
-
+        
         # Outputs
+        
         output_dict = dict(output_token_ids=output_token_ids)
+        output_dict['inference_steps'] = inference_steps
+        output_dict['wall_time'] = wall_time_list
+        output_dict['pad_tokens'] = [0 for _ in range(batch_size)]
         if return_output_length:
-            output_dict['output_lengths'] = sequence_lengths
+            output_dict['output_lengths'] = sequence_lengths-pad_lengths
         if return_log_probs:
             output_dict['cum_log_probs'] = cum_log_probs
             output_dict['output_log_probs'] = output_log_probs

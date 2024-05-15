@@ -65,12 +65,16 @@ void fusedQKV_masked_attention_dispatch(const T*     qkv_buf,
                                         const float* qkv_scale_out,
                                         const float* attention_out_scale,
                                         const int    int8_mode,
-                                        cudaStream_t stream)
+                                        cudaStream_t stream,
+                                        const int total_input_length,
+                                        const int* token_nums_per_sample)
 {
     using DataType = typename SATypeConverter<T>::Type;
     // Prepare the parameters.
     Masked_multihead_attention_params<DataType> params;
     memset(&params, 0, sizeof(params));
+    params.token_nums_per_sample = token_nums_per_sample;
+    params.total_input_length = total_input_length;
     int hidden_units = head_num * size_per_head;
     if (qkv_bias != nullptr) {
         params.q_bias = reinterpret_cast<const DataType*>(qkv_bias);
@@ -178,7 +182,9 @@ void fusedQKV_masked_attention_dispatch(const T*     qkv_buf,
                                                      const float* qkv_scale_out,                                       \
                                                      const float* attention_out_scale,                                 \
                                                      const int    int8_mode,                                           \
-                                                     cudaStream_t stream)
+                                                     cudaStream_t stream,                                              \
+                                                     const int total_input_length,                                     \
+                                                     const int* token_nums_per_sample)
 
 INSTANTIATE_FUSEDQKV_MASKED_ATTENTION_DISPATCH(float);
 INSTANTIATE_FUSEDQKV_MASKED_ATTENTION_DISPATCH(half);
@@ -488,6 +494,7 @@ void DecoderSelfAttentionLayer<T>::forward(TensorMap*                output_tens
 
     const T*    attention_input         = input_tensors->getPtr<T>("input_query");
     const int*  sequence_lengths        = input_tensors->getPtr<int>("sequence_lengths");
+    const int*  token_nums_per_sample        = input_tensors->getPtr<int>("token_nums_per_sample");
     const bool* finished                = input_tensors->getPtr<bool>("finished", nullptr);
     const bool* masked_tokens           = input_tensors->getPtr<bool>("masked_tokens", nullptr);
     const int*  cache_indir             = input_tensors->getPtr<int>("cache_indirection", nullptr);
@@ -501,7 +508,8 @@ void DecoderSelfAttentionLayer<T>::forward(TensorMap*                output_tens
     T* key_cache     = output_tensors->getPtr<T>("key_cache");
     T* value_cache   = output_tensors->getPtr<T>("value_cache");
 
-    const int batch_size     = input_tensors->at("input_query").shape[0];
+    const int batch_size     = input_tensors->at("token_nums_per_sample").size();
+    const int total_input_length     = input_tensors->at("input_query").shape[0];
     const int beam_width     = cache_indir != nullptr ? input_tensors->at("cache_indirection").shape[1] : 1;
     const int memory_max_len = output_tensors->at("key_cache").shape[3];
 
@@ -538,7 +546,7 @@ void DecoderSelfAttentionLayer<T>::forward(TensorMap*                output_tens
                 reinterpret_cast<const uint8_t*>(attention_weights->query_weight.int8_kernel),
                 attention_weights->query_weight.weight_only_quant_scale,
                 qkv_buf_,
-                batch_size,
+                total_input_length,
                 3 * local_hidden_units_,
                 d_model_,
                 mixed_gemm_workspace_,
@@ -551,7 +559,7 @@ void DecoderSelfAttentionLayer<T>::forward(TensorMap*                output_tens
             // [s_q, s_q, ..., s_q, s_k, s_k, ..., s_k, s_v, s_v, ..., s_v],
             // where s_q are scales of q, s_k are scales of k and s_v are scales of v.
             cublas_wrapper_->Int8Gemm(3 * local_hidden_units_,
-                                      batch_size,
+                                      total_input_length,
                                       d_model_,
                                       attention_weights->query_weight.int8_kernel,
                                       d_model_,
@@ -566,7 +574,7 @@ void DecoderSelfAttentionLayer<T>::forward(TensorMap*                output_tens
             cublas_wrapper_->Gemm(CUBLAS_OP_N,
                                   CUBLAS_OP_N,
                                   3 * local_hidden_units_,  // n
-                                  batch_size,
+                                  total_input_length,
                                   d_model_,  // k
                                   attention_weights->query_weight.kernel,
                                   3 * local_hidden_units_,  // n
@@ -578,6 +586,45 @@ void DecoderSelfAttentionLayer<T>::forward(TensorMap*                output_tens
     }
     sync_check_cuda_error();
     POP_RANGE;
+    if(input_tensors->getVal<int>("token_nums_per_sample_max") !=1){
+        fusedQKV_masked_attention_dispatch<T>(
+            qkv_buf_,
+            attention_weights->query_weight.bias,
+            relative_attention_bias,
+            key_cache,
+            value_cache,
+            cache_indir,
+            context_buf_,
+            finished,
+            sequence_lengths,  // NOTE: current seq len including padding (fixed after meeting the finished id)
+            batch_size,
+            batch_size,
+            beam_width,
+            local_head_num_,
+            size_per_head_,
+            rotary_embedding_dim_,
+            neox_rotary_style_,
+            memory_max_len,
+            d_prefix_prompt_lengths,
+            max_prefix_prompt_length,
+            input_tensors->getVal<int>("max_input_length", 0),
+            input_tensors->getPtr<int>("total_padding_tokens", nullptr),
+            input_tensors->getVal<int>("step"),
+            q_scaling_,
+            relative_attention_bias_stride,
+            linear_bias_slopes,
+            masked_tokens,
+            input_tensors->getPtr<int>("ia3_tasks", nullptr),
+            has_ia3 ? attention_weights->ia3_key_weight.kernel : nullptr,
+            has_ia3 ? attention_weights->ia3_value_weight.kernel : nullptr,
+            int8_mode_ == 2 ? attention_weights->query_weight.scale_out : nullptr,
+            int8_mode_ == 2 ? attention_weights->attention_output_weight.scale : nullptr,
+            int8_mode_,
+            stream_,
+            total_input_length,
+            token_nums_per_sample);
+        sync_check_cuda_error();
+    }
     fusedQKV_masked_attention_dispatch<T>(
         qkv_buf_,
         attention_weights->query_weight.bias,
@@ -611,7 +658,9 @@ void DecoderSelfAttentionLayer<T>::forward(TensorMap*                output_tens
         int8_mode_ == 2 ? attention_weights->query_weight.scale_out : nullptr,
         int8_mode_ == 2 ? attention_weights->attention_output_weight.scale : nullptr,
         int8_mode_,
-        stream_);
+        stream_,
+        total_input_length,
+        token_nums_per_sample);
     sync_check_cuda_error();
 
     PUSH_RANGE("proj gemm");
@@ -642,7 +691,7 @@ void DecoderSelfAttentionLayer<T>::forward(TensorMap*                output_tens
                 reinterpret_cast<const uint8_t*>(attention_weights->attention_output_weight.int8_kernel),
                 attention_weights->attention_output_weight.weight_only_quant_scale,
                 attention_out,
-                batch_size,
+                total_input_length,
                 d_model_,
                 local_hidden_units_,
                 mixed_gemm_workspace_,
@@ -656,7 +705,7 @@ void DecoderSelfAttentionLayer<T>::forward(TensorMap*                output_tens
                                   attention_weights->attention_output_weight.scale_inter,
                                   attention_weights->attention_output_weight.scale_out,
                                   output_tensors->getPtr<T>("hidden_features"),
-                                  batch_size,
+                                  total_input_length,
                                   d_model_,
                                   local_hidden_units_,
                                   nullptr,
@@ -667,7 +716,7 @@ void DecoderSelfAttentionLayer<T>::forward(TensorMap*                output_tens
             cublas_wrapper_->Gemm(CUBLAS_OP_N,
                                   CUBLAS_OP_N,
                                   d_model_,  // n
-                                  batch_size,
+                                  total_input_length,
                                   local_hidden_units_,  // k
                                   attention_weights->attention_output_weight.kernel,
                                   d_model_,  // n

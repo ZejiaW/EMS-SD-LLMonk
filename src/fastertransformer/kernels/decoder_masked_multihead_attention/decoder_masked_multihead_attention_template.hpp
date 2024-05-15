@@ -1063,7 +1063,7 @@ inline size_t smem_size_in_bytes(const Multihead_attention_params<T, DO_CROSS_AT
 {
     using Tk = typename kernel_type_t<T>::Type;
     // The amount of shared memory needed to store the Q*K^T values in float.
-    const int max_timesteps = min(params.timestep, params.memory_max_len);
+    const int max_timesteps = params.memory_max_len;
     size_t qk_sz = (DO_CROSS_ATTENTION) ? div_up(params.memory_max_len + 1, 4) * 16 : div_up(max_timesteps + 1, 4) * 16;
 
     // The extra memory needed if we are not using floats for the final logits.
@@ -1118,6 +1118,17 @@ template<
     bool HAS_BEAMS>
 __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T, DO_CROSS_ATTENTION> params)
 {
+    // this step 
+    int this_step = blockIdx.y;
+    int bi = 0;
+    int qkv_batch_offset = 0;
+    for(size_t i=0;i<params.batch_size;i++){
+        if(this_step >= params.token_nums_per_sample[i]){
+            this_step -= params.token_nums_per_sample[i];
+            bi++;
+            qkv_batch_offset += params.token_nums_per_sample[i];
+        } else break;
+    }
 
     using Tk = typename kernel_type_t<T>::Type;
 #ifdef ENABLE_FP8
@@ -1147,7 +1158,7 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T, 
 #ifndef MMHA_USE_FP32_ACUM_FOR_LOGITS
     if (sizeof(Tk) != 4) {
         // TODO - change to tlength
-        const int max_timesteps = min(params.timestep, params.memory_max_len);
+        const int max_timesteps = min(params.timestep+this_step, params.memory_max_len);
         logits_smem_ +=
             (DO_CROSS_ATTENTION) ? div_up(params.memory_max_len + 1, 4) * 16 : div_up(max_timesteps + 1, 4) * 16;
     }
@@ -1192,7 +1203,7 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T, 
     constexpr int QK_VECS_IN_16B = 16 / sizeof(Qk_vec_m);
 
     // The batch/beam idx
-    const int bi = blockIdx.y;
+
     if (params.finished != nullptr && params.finished[bi] == true) {
         return;
     }
@@ -1216,7 +1227,7 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T, 
 
     float qk = 0.0F;
 
-    int qkv_base_offset = (params.stride == 0) ? bhi * Dh : bi * params.stride + hi * Dh;
+    int qkv_base_offset = (params.stride == 0) ? bhi * Dh : qkv_batch_offset*params.stride+this_step*params.stride+ hi * Dh;
 
     const size_t bi_seq_len_offset = bi * params.memory_max_len;
 
@@ -1224,7 +1235,7 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T, 
     int       tlength      = (DO_CROSS_ATTENTION) ? params.memory_length_per_sample[bi] - 1 :
                              (params.length_per_sample == nullptr) ?
                                                     params.timestep :
-                                                    params.length_per_sample[bi] + params.max_prefix_prompt_length;
+                                                    params.length_per_sample[bi] + params.max_prefix_prompt_length + this_step;
     const int first_step   = max(0, tlength + 1 - params.memory_max_len);
     const int tlength_circ = tlength % params.memory_max_len;
 
@@ -1653,7 +1664,7 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T, 
     // for( int ti = tidx; ti <= params.timestep; ti += THREADS_PER_BLOCK ) {
     const size_t cross_attention_out_offset =
         params.is_return_cross_attentions ?
-            bhi * params.max_decoder_seq_len * params.memory_max_len + params.timestep * params.memory_max_len :
+            bhi * params.max_decoder_seq_len * params.memory_max_len + (params.timestep+this_step) * params.memory_max_len :
             0;
     for (int ti = first_step + tidx; ti <= tlength; ti += THREADS_PER_BLOCK) {
         float logit = qk_smem[ti - first_step] * inv_sum;
@@ -1925,11 +1936,11 @@ __global__ void masked_multihead_attention_kernel(Multihead_attention_params<T, 
         else if (params.int8_mode == 2) {
             using Packed_Int8_t = typename packed_type<int8_t, num_elems<V_vec_acum>::value>::type;
             out                 = mul<V_vec_acum, float>(*params.attention_out_scale, out);
-            *reinterpret_cast<Packed_Int8_t*>(&(reinterpret_cast<int8_t*>(params.out)[bhi * Dh + vi])) =
+            *reinterpret_cast<Packed_Int8_t*>(&(reinterpret_cast<int8_t*>(params.out)[(qkv_batch_offset*params.num_heads+this_step*params.num_heads + hi) * Dh + vi])) =
                 cast_to_int8(out);
         }
         else {
-            convert_from_float(*reinterpret_cast<V_vec_m*>(&params.out[bhi * Dh + vi]), out);
+            convert_from_float(*reinterpret_cast<V_vec_m*>(&params.out[(qkv_batch_offset*params.num_heads+this_step*params.num_heads + hi) * Dh + vi]), out);
         }
 #else   // MMHA_USE_FP32_ACUM_FOR_OUT
         // TODO: support int8_mode?

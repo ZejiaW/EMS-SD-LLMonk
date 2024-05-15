@@ -183,6 +183,8 @@ void fusedQKV_masked_attention_dispatch(const T*     qkv_buf,
                                         const float* qkv_scale_out,
                                         const float* attention_out_scale,
                                         const int    int8_mode,
-                                        cudaStream_t stream);
+                                        cudaStream_t stream,
+                                        const int total_input_length=0,
+                                        const int* token_nums_per_sample=nullptr);
 
 }  // namespace fastertransformer

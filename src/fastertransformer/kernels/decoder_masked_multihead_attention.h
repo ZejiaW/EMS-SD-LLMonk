@@ -50,7 +50,8 @@
 
 template<typename T>
 struct Multihead_attention_params_base {
-
+    const int* token_nums_per_sample = nullptr;
+    int total_input_length = 0;
     // The output buffer. Dimensions B x D.
     T* out = nullptr;
 

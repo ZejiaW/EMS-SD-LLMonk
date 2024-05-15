@@ -14,14 +14,25 @@
 
 import torch
 import torch.distributed as dist
-
+from mpi4py import MPI
 
 def get_world_size():
-    return dist.get_world_size() if dist.is_initialized() else 1
+    size = 1
+    if dist.is_initialized():
+        size = dist.get_world_size()
+    elif MPI.Is_initialized():
+        comm = MPI.COMM_WORLD
+        size = comm.Get_size()
+    return size
 
 
 def get_rank():
-    return dist.get_rank() if dist.is_initialized() else 0
+    if dist.is_initialized():
+        rank = dist.get_rank()
+    elif MPI.Is_initialized():
+        comm = MPI.COMM_WORLD
+        rank = comm.Get_rank()
+    return rank
 
 
 def get_device_count():
@@ -83,7 +94,7 @@ def initialize_model_parallel(tensor_para_size: int,
         f'parallel group has been already initialized.'
 
     print('Initializing tensor and pipeline parallel...')
-    dist.init_process_group(backend=backend)
+    # dist.init_process_group(backend=backend)
 
     global _model_para_group
     _model_para_group = ModelParallelGroup(tensor_para_size, pipeline_para_size)

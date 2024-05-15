@@ -154,7 +154,9 @@ void FtGptDecoder<T>::forward(const int64_t            max_input_length,
                               th::Tensor&              key_cache,
                               th::Tensor&              value_cache,
                               th::optional<th::Tensor> cache_indirection_opt,
-                              th::optional<th::Tensor> linear_bias_slopes_opt)
+                              th::optional<th::Tensor> linear_bias_slopes_opt,
+                              th::optional<th::Tensor> token_nums_per_sample,
+                              const int64_t            token_nums_per_sample_max)
 {
     // Input Arguments:
     //     input_embeds: [local_batch_size * beam_width, hidden_units], T
@@ -224,7 +226,8 @@ void FtGptDecoder<T>::forward(const int64_t            max_input_length,
         {"max_input_length", ft::Tensor(ft::MEMORY_CPU, ft::TYPE_INT32, {1}, &_max_input_length)},
         {"step", ft::Tensor(ft::MEMORY_CPU, ft::TYPE_INT32, {1}, &_step)},
         {"ite", ft::Tensor(ft::MEMORY_CPU, ft::TYPE_INT32, {1}, &_ite)},
-        {"masked_tokens", convert_tensor<bool>(masked_tokens)}};
+        {"masked_tokens", convert_tensor<bool>(masked_tokens)},
+        {"token_nums_per_sample_max", ft::Tensor(ft::MEMORY_CPU, ft::TYPE_INT32, {1}, &token_nums_per_sample_max)}};
     if (cache_indirection_opt.has_value()) {
         FT_CHECK_WITH_INFO(
             cache_indirection_opt.value().dim() == 3,
@@ -235,6 +238,9 @@ void FtGptDecoder<T>::forward(const int64_t            max_input_length,
     }
     if (linear_bias_slopes_opt.has_value()) {
         input_tensors.insert({"linear_bias_slopes", convert_tensor<T>(linear_bias_slopes_opt.value())});
+    }
+    if (token_nums_per_sample.has_value()) {
+        input_tensors.insert({"token_nums_per_sample", convert_tensor<int>(token_nums_per_sample.value())});
     }
 
     std::unordered_map<std::string, ft::Tensor> output_tensors{{"decoder_output", convert_tensor<T>(decoder_output)},
@@ -330,7 +336,9 @@ std::vector<th::Tensor> ParallelGptDecoderOp::forward(const int64_t            m
                                                       th::Tensor               key_cache,
                                                       th::Tensor               value_cache,
                                                       th::optional<th::Tensor> cache_indirection_opt,
-                                                      th::optional<th::Tensor> linear_bias_slopes_opt)
+                                                      th::optional<th::Tensor> linear_bias_slopes_opt,
+                                                      th::optional<th::Tensor> token_nums_per_sample,
+                                                      const int64_t            token_nums_per_sample_max)
 {
     CHECK_INPUT(input_embeds, scalar_type_);
     CHECK_INPUT(finished, torch::kBool);
@@ -360,7 +368,9 @@ std::vector<th::Tensor> ParallelGptDecoderOp::forward(const int64_t            m
                           key_cache,
                           value_cache,
                           cache_indirection_opt,
-                          linear_bias_slopes_opt);
+                          linear_bias_slopes_opt,
+                          token_nums_per_sample,
+                          token_nums_per_sample_max);
     return std::vector<th::Tensor>{decoder_output};
 }
 

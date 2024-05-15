@@ -291,8 +291,9 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
     FT_CHECK(output_tensors->count("key_cache"));
     FT_CHECK(output_tensors->count("value_cache"));
 
-    const size_t local_batch_size = input_tensors->at("decoder_input").shape[0];
-    allocateBuffer(local_batch_size);
+    const size_t total_input_length = input_tensors->at("decoder_input").shape[0];
+    const size_t local_batch_size = input_tensors->at("token_nums_per_sample").size();
+    allocateBuffer(total_input_length);
 
     const DataType data_type = getTensorType<T>();
 
@@ -324,7 +325,7 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
             (l == num_layer_ - 1) ? output_tensors->at("decoder_output").getPtr<T>() : decoder_layer_output_;
 
         if (isFirstLayerParallelId(l) == true && pipeline_para_.rank_ != 0 && pipeline_para_.world_size_ > 1) {
-            size_t data_size = local_batch_size * hidden_units_ / tensor_para_.world_size_;
+            size_t data_size = total_input_length * hidden_units_ / tensor_para_.world_size_;
             PUSH_RANGE("input communication");
             ftNcclRecv(decoder_input + data_size * tensor_para_.rank_,
                        data_size,
@@ -348,7 +349,7 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
                                    layer_weight->pre_layernorm_weights.gamma,
                                    layer_weight->pre_layernorm_weights.beta,
                                    layernorm_eps_,
-                                   local_batch_size,
+                                   total_input_length,
                                    hidden_units_,
                                    const_cast<float*>(layer_weight->self_attention_weights.query_weight.scale),
                                    int8_mode_,
@@ -361,14 +362,16 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
             {"input_query",
              Tensor{MEMORY_GPU,
                     activation_in_type,
-                    {local_batch_size, hidden_units_},
+                    {total_input_length, hidden_units_},
                     layernorm_type_ == LayerNormType::pre_layernorm ? decoder_normed_input_ : decoder_input}},
             {"finished", input_tensors->at("finished")},
             {"sequence_lengths", input_tensors->at("input_lengths")},
             {"total_padding_tokens", input_tensors->at("total_padding_tokens")},
             {"max_input_length", input_tensors->at("max_input_length")},
             {"step", input_tensors->at("step")},
-            {"masked_tokens", input_tensors->at("masked_tokens")}};
+            {"masked_tokens", input_tensors->at("masked_tokens")},
+            {"token_nums_per_sample_max", input_tensors->at("token_nums_per_sample_max")},
+            {"token_nums_per_sample", input_tensors->at("token_nums_per_sample")}};
         if (input_tensors->count("cache_indirection")) {
             self_attention_input_tensors.insert("cache_indirection", input_tensors->at("cache_indirection"));
         }
@@ -380,7 +383,7 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
         for (auto t = k_cache.shape.begin() + 1; t != k_cache.shape.end(); ++t) {
             cache_offset *= *t;
         };
-        size_t ite_cache_offset = ite * local_batch_size;
+        size_t ite_cache_offset = ite * total_input_length;
         for (auto t = k_cache.shape.begin() + 2; t != k_cache.shape.end(); ++t) {
             ite_cache_offset *= *t;
         }
@@ -388,7 +391,7 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
 
         TensorMap self_attention_output_tensors{
             {"hidden_features",
-             Tensor(MEMORY_GPU, activation_out_type, {local_batch_size, hidden_units_}, self_attn_output_)},
+             Tensor(MEMORY_GPU, activation_out_type, {total_input_length, hidden_units_}, self_attn_output_)},
             {"key_cache", Tensor(MEMORY_GPU, data_type, self_k_cache_size, k_cache.getPtrWithOffset<T>(cache_offset))},
             {"value_cache",
              Tensor(MEMORY_GPU, data_type, self_v_cache_size, v_cache.getPtrWithOffset<T>(cache_offset))}};
@@ -406,7 +409,7 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
                 nullptr,
                 nullptr,
                 nullptr,
-                local_batch_size,
+                total_input_length,
                 hidden_units_,
                 0,
                 nullptr,
@@ -414,10 +417,10 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
                 stream_);
 
             TensorMap ffn_input_tensors(
-                {{"ffn_input", Tensor{MEMORY_GPU, data_type, {local_batch_size, hidden_units_}, self_attn_output_}}});
+                {{"ffn_input", Tensor{MEMORY_GPU, data_type, {total_input_length, hidden_units_}, self_attn_output_}}});
             TensorMap ffn_output_tensors(
                 {{"ffn_output",
-                  Tensor{MEMORY_GPU, data_type, {local_batch_size, hidden_units_}, after_adapter_attn_output_}}});
+                  Tensor{MEMORY_GPU, data_type, {total_input_length, hidden_units_}, after_adapter_attn_output_}}});
 
             ffn_layer_->resetInterSize(adapter_inter_size_ / tensor_para_.world_size_);
             ffn_layer_->forward(
@@ -438,7 +441,7 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
                 has_adapters_ ? layer_weight->after_attention_adapter_weights.output_weight.bias :
                                 layer_weight->self_attention_weights.attention_output_weight.bias,
                 layernorm_eps_,
-                local_batch_size,
+                total_input_length,
                 hidden_units_,
                 nullptr,
                 nullptr,
@@ -457,7 +460,7 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
                 layer_weight->pre_layernorm_weights.gamma,
                 layer_weight->pre_layernorm_weights.beta,
                 layernorm_eps_,
-                local_batch_size,
+                total_input_length,
                 hidden_units_,
                 stream_);
         }
@@ -471,14 +474,14 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
             {{"ffn_input",
               Tensor{MEMORY_GPU,
                      activation_in_type,
-                     {local_batch_size, hidden_units_},
+                     {total_input_length, hidden_units_},
                      layernorm_type_ == LayerNormType::pre_layernorm ? normed_self_attn_output_ :
                                                                        after_adapter_attn_output_}}});
         TensorMap ffn_output_tensors;
         if (!use_moe) {
             ffn_output_tensors.insert(
                 "ffn_output",
-                Tensor{MEMORY_GPU, activation_out_type, {local_batch_size, hidden_units_}, ffn_output_ptr});
+                Tensor{MEMORY_GPU, activation_out_type, {total_input_length, hidden_units_}, ffn_output_ptr});
         }
         else {
             ffn_input_tensors.insert("moe_k", Tensor{MEMORY_CPU, TYPE_UINT64, {1}, &moe_k_});
@@ -486,16 +489,16 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
             ffn_output_tensors.insert("ffn_output",
                                       Tensor{MEMORY_GPU,
                                              activation_out_type,
-                                             {moe_k_ * local_batch_size, hidden_units_},
+                                             {moe_k_ * total_input_length, hidden_units_},
                                              has_adapters_ ? adapter_fc2_result_ : fc2_result_});
             ffn_output_tensors.insert(
-                "expert_scales", Tensor{MEMORY_GPU, activation_out_type, {local_batch_size, moe_k_}, expert_scales_});
+                "expert_scales", Tensor{MEMORY_GPU, activation_out_type, {total_input_length, moe_k_}, expert_scales_});
             ffn_output_tensors.insert(
                 "expanded_source_row_to_expanded_dest_row",
-                Tensor{MEMORY_GPU, TYPE_INT32, {local_batch_size, moe_k_}, expanded_source_row_to_expanded_dest_row_});
+                Tensor{MEMORY_GPU, TYPE_INT32, {total_input_length, moe_k_}, expanded_source_row_to_expanded_dest_row_});
             ffn_output_tensors.insert(
                 "expert_for_source_row",
-                Tensor{MEMORY_GPU, TYPE_INT32, {local_batch_size, moe_k_}, expert_for_source_row_});
+                Tensor{MEMORY_GPU, TYPE_INT32, {total_input_length, moe_k_}, expert_for_source_row_});
         }
 
         ffn_layer_->resetInterSize(inter_size_ / tensor_para_.world_size_);
@@ -513,7 +516,7 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
                                                                   nullptr,
                                                                   nullptr,
                                                                   nullptr,
-                                                                  local_batch_size,
+                                                                  total_input_length,
                                                                   hidden_units_,
                                                                   0,
                                                                   nullptr,
@@ -521,9 +524,9 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
                                                                   stream_);
 
                 ffn_input_tensors.insert(
-                    "ffn_input", Tensor{MEMORY_GPU, data_type, {local_batch_size, hidden_units_}, ffn_output_ptr});
+                    "ffn_input", Tensor{MEMORY_GPU, data_type, {total_input_length, hidden_units_}, ffn_output_ptr});
                 ffn_output_tensors.insert(
-                    "ffn_output", Tensor{MEMORY_GPU, data_type, {local_batch_size, hidden_units_}, decoder_output});
+                    "ffn_output", Tensor{MEMORY_GPU, data_type, {total_input_length, hidden_units_}, decoder_output});
             }
             else {
                 invokeGenericActivation<IdentityActivation, T, T>(adapter_fc2_result_,
@@ -532,7 +535,7 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
                                                                   nullptr,
                                                                   nullptr,
                                                                   nullptr,
-                                                                  moe_k_ * local_batch_size,
+                                                                  moe_k_ * total_input_length,
                                                                   hidden_units_,
                                                                   0,
                                                                   nullptr,
@@ -541,10 +544,10 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
 
                 ffn_input_tensors.insert(
                     "ffn_input",
-                    Tensor{MEMORY_GPU, data_type, {moe_k_ * local_batch_size, hidden_units_}, adapter_fc2_result_});
+                    Tensor{MEMORY_GPU, data_type, {moe_k_ * total_input_length, hidden_units_}, adapter_fc2_result_});
                 ffn_output_tensors.insert(
                     "ffn_output",
-                    Tensor{MEMORY_GPU, data_type, {moe_k_ * local_batch_size, hidden_units_}, fc2_result_});
+                    Tensor{MEMORY_GPU, data_type, {moe_k_ * total_input_length, hidden_units_}, fc2_result_});
             }
 
             ffn_layer_->resetInterSize(adapter_inter_size_ / tensor_para_.world_size_);
@@ -561,7 +564,7 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
                                                       layer_weight->ffn_weights.output_weight.bias,
                                       nullptr,
                                       nullptr,
-                                      local_batch_size,
+                                      total_input_length,
                                       hidden_units_,
                                       stream_);
             }
@@ -574,7 +577,7 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
                                                layer_weight->self_attn_layernorm_weights.gamma,
                                                layer_weight->self_attn_layernorm_weights.beta,
                                                layernorm_eps_,
-                                               local_batch_size,
+                                               total_input_length,
                                                hidden_units_,
                                                stream_);
             }
@@ -591,7 +594,7 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
                                                     expert_scales_,
                                                     expanded_source_row_to_expanded_dest_row_,
                                                     expert_for_source_row_,
-                                                    local_batch_size,
+                                                    total_input_length,
                                                     hidden_units_,
                                                     moe_k_,
                                                     stream_);
@@ -606,7 +609,7 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
                                                     expert_scales_,
                                                     expanded_source_row_to_expanded_dest_row_,
                                                     expert_for_source_row_,
-                                                    local_batch_size,
+                                                    total_input_length,
                                                     hidden_units_,
                                                     moe_k_,
                                                     stream_);
@@ -615,7 +618,7 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
                                        layer_weight->self_attn_layernorm_weights.gamma,
                                        layer_weight->self_attn_layernorm_weights.beta,
                                        layernorm_eps_,
-                                       local_batch_size,
+                                       total_input_length,
                                        hidden_units_,
                                        (float*)nullptr,
                                        0,
@@ -630,8 +633,8 @@ void ParallelGptDecoder<T>::forward(std::unordered_map<std::string, Tensor>*    
             && pipeline_para_.world_size_ > 1) {
 
             ftNcclSend(decoder_output
-                           + local_batch_size * hidden_units_ / tensor_para_.world_size_ * tensor_para_.rank_,
-                       local_batch_size * hidden_units_ / tensor_para_.world_size_,
+                           + total_input_length * hidden_units_ / tensor_para_.world_size_ * tensor_para_.rank_,
+                       total_input_length * hidden_units_ / tensor_para_.world_size_,
                        pipeline_para_.rank_ + 1,
                        pipeline_para_,
                        stream_);

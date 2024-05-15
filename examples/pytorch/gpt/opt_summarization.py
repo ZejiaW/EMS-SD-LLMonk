@@ -20,11 +20,16 @@ import sys
 import torch
 import torch.distributed as dist
 from datetime import datetime
-from datasets import load_dataset, load_metric
+from datasets import load_dataset, load_metric, load_from_disk
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-from tqdm import tqdm
+
+from utils import comm
+from tqdm import trange
 
 from utils import gpt_decoder
+from utils import profiler
+import json
+import pandas as pd
 
 dir_path = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(dir_path + "/../../..")
@@ -32,6 +37,7 @@ from examples.pytorch.gpt.utils.parallel_gpt import ParallelGPT
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--num_samples', type=int, default=8)
     parser.add_argument('--ft_model_location', type=str,
                         default='/models/GPT/HF/gpt2-xl/c-models')
     parser.add_argument('--hf_model_name', type=str,
@@ -71,24 +77,55 @@ def main():
         help='Threshold of FT rougeLsum score')
     parser.add_argument(
         '--verbose', action='store_true', help='Print all summary result.')
+    parser.add_argument(
+        '--max_batch_size', type=int, default=1, help='max batch size.')
+    parser.add_argument('--output_len', type=int, default=128)
+    parser.add_argument('--save_root', type=str, default="../outputs")
+    parser.add_argument('--name', type=str, default="nona")
+    parser.add_argument('--method', type=str, default="baseline")
+    parser.add_argument('--check_length', type=int, default=2)
+    parser.add_argument('--copy_length', type=int, default=7)
+    parser.add_argument('--draft_ft_model_location', type=str,
+                        default='/models/GPT/HF/gpt2-xl/c-models')
+    parser.add_argument('--draft_hf_model_name', type=str,
+                        default='facebook/opt-350m')
+    parser.add_argument('--draft_steps_max', type=int, default=4)
 
     args = parser.parse_args()
-    np.random.seed(1) # rouge score use sampling to compute the score
+    if args.method == "baseline":
+        pass
+    elif args.method == "LLMA_vanilla":
+        from utils.gpt_LLMA_vanilla import gpt_LLMA
+    elif args.method == "LLMA_EMS":
+        from utils.gpt_LLMA_EMS import gpt_LLMA
+    elif args.method == "LLMA_EMS_ablation_unpad_inputs":
+        from utils.gpt_LLMA_EMS_ablation_unpad_inputs import gpt_LLMA
+    elif args.method == "LLMA_EMS_ablation_unpad_kv_cache":
+        from utils.gpt_LLMA_EMS_ablation_unpad_kv_cache import gpt_LLMA
+    elif args.method == "SD_vanilla":
+        from utils.gpt_specutive_decoding_vanilla import gpt_speculative_decoding
+    elif args.method == "SD_EMS":
+        from utils.gpt_specutive_decoding_EMS import gpt_speculative_decoding
+    else:
+        raise NotImplemented
+    
 
-    try:
-        dist.init_process_group(backend='mpi')
-    except:
-        print("[INFO] WARNING: Have initialized the process group")
-    rank = dist.get_rank()
+    np.random.seed(1) # rouge score use sampling to compute the score
+    comm.initialize_model_parallel(args.tensor_para_size, args.pipeline_para_size)
+    rank = comm.get_rank()
+
+    if rank == 0:
+        os.makedirs(f"{args.save_root}", exist_ok=True)
+        f = open(f"{args.save_root}/{args.name}.jsonl", 'w')
 
     summarize = args.summarize
     test_hf = args.test_hf
     ft_model_location = args.ft_model_location
     hf_model_name = args.hf_model_name
 
-    tokenizer = AutoTokenizer.from_pretrained(hf_model_name)
+    tokenizer = AutoTokenizer.from_pretrained(hf_model_name, use_fast=False)
     tokenizer.pad_token = tokenizer.eos_token
-    dataset_cnn = load_dataset("ccdv/cnn_dailymail", '3.0.0', cache_dir=args.cache_path)
+    dataset_cnn = load_from_disk("../datasets/cnn_dailymail/")
 
     hf_config = vars(AutoConfig.from_pretrained(hf_model_name))
 
@@ -106,16 +143,12 @@ def main():
     # has post decoder layernorm when layernorm_type is pre layernorm
     has_post_decoder_layernorm = layernorm_type == 'pre_layernorm'
 
-    if summarize:
-        top_k = 2
-        output_len = 100
-    else:
-        top_k = 1
-        output_len = 256
+    top_k = 1
+    output_len = args.output_len
     top_p = 0.0
-    temperature = 1
+    temperature = 0
     max_seq_len = hf_config['max_position_embeddings']
-    max_batch_size = 1
+    max_batch_size = args.max_batch_size
     repetition_penalty = 1
     random_seed = 0
     vocab_size = hf_config['vocab_size']
@@ -124,19 +157,20 @@ def main():
     lib_path = args.lib_path
     ckpt_path = os.path.join(ft_model_location, f'{tensor_para_size}-gpu')
 
-    print(f"top_k: {top_k}")
-    print(f"top_p: {top_p}")
-    print(f"int8_mode: {args.int8_mode}")
-    print(f"temperature: {temperature}")
-    print(f"max_seq_len: {max_seq_len}")
-    print(f"max_batch_size: {max_batch_size}")
-    print(f"repetition_penalty: {repetition_penalty}")
-    print(f"vocab_size: {vocab_size}")
-    print(f"tensor_para_size: {tensor_para_size}")
-    print(f"pipeline_para_size: {pipeline_para_size}")
-    print(f"lib_path: {lib_path}")
-    print(f"ckpt_path: {ckpt_path}")
-    print(f"hf_config: {hf_config}")
+    if rank == 0:
+        print(f"top_k: {top_k}")
+        print(f"top_p: {top_p}")
+        print(f"int8_mode: {args.int8_mode}")
+        print(f"temperature: {temperature}")
+        print(f"max_seq_len: {max_seq_len}")
+        print(f"max_batch_size: {max_batch_size}")
+        print(f"repetition_penalty: {repetition_penalty}")
+        print(f"vocab_size: {vocab_size}")
+        print(f"tensor_para_size: {tensor_para_size}")
+        print(f"pipeline_para_size: {pipeline_para_size}")
+        print(f"lib_path: {lib_path}")
+        print(f"ckpt_path: {ckpt_path}")
+        print(f"hf_config: {hf_config}")
 
     infer_decode_args = dict(
         beam_width=1,
@@ -148,6 +182,7 @@ def main():
     )
 
     if not args.use_gpt_decoder_ops:
+        assert False, "only support use_gpt_decoder_ops now"
         gpt = ParallelGPT(head_num, size_per_head, vocab_size, start_id, end_id, layer_num,
                           max_seq_len, tensor_para_size, pipeline_para_size, lib_path,
                           inference_data_type=args.data_type,
@@ -180,6 +215,42 @@ def main():
             weights_data_type=args.weights_data_type,
             use_fp32_to_compute_logit=args.use_fp32_to_compute_logit)
         gpt.load(ckpt_path, args.data_type)
+        if "SD" in args.method:
+            draft_steps_max = args.draft_steps_max
+
+            draft_ft_model_location = args.draft_ft_model_location
+            draft_ckpt_path = os.path.join(draft_ft_model_location, f'{tensor_para_size}-gpu')
+            draft_hf_model_name = args.draft_hf_model_name
+            draft_hf_config = vars(AutoConfig.from_pretrained(draft_hf_model_name))
+
+            draft_head_num = draft_hf_config['num_attention_heads']
+            draft_layer_num = draft_hf_config['num_hidden_layers']
+            draft_size_per_head = draft_hf_config['hidden_size'] // draft_head_num
+
+            draft_layernorm_type = 'pre_layernorm' if draft_hf_config['do_layer_norm_before'] else 'post_layernorm'
+            draft_activation_type = 'Relu' if draft_hf_config['activation_function'] == 'relu' else 'Gelu'
+            
+            draft_has_post_decoder_layernorm = draft_layernorm_type == 'pre_layernorm'
+            draft_gpt = gpt_decoder.Gpt(
+                num_heads=draft_head_num,
+                size_per_head=draft_size_per_head,
+                num_layers=draft_layer_num,
+                vocab_size=vocab_size,
+                start_id=start_id,
+                end_id=end_id,
+                tensor_para_size=tensor_para_size,
+                pipeline_para_size=pipeline_para_size,
+                lib_path=lib_path,
+                max_seq_len=max_seq_len,
+                layernorm_eps=layernorm_eps,
+                layernorm_type=draft_layernorm_type,
+                activation_type=draft_activation_type,
+                has_post_decoder_layernorm=draft_has_post_decoder_layernorm,
+                int8_mode=args.int8_mode,
+                inference_data_type=args.data_type,
+                weights_data_type=args.weights_data_type,
+                use_fp32_to_compute_logit=args.use_fp32_to_compute_logit)
+            draft_gpt.load(draft_ckpt_path, args.data_type)
 
     if (test_hf and summarize) or not summarize:
         model = AutoModelForCausalLM.from_pretrained(hf_model_name)
@@ -199,7 +270,7 @@ def main():
 
         line_encoded = tokenizer.encode(line, return_tensors='pt')
         if summarize:
-            line_encoded = line_encoded[:, -923:]
+            line_encoded = line_encoded[:, -(max_seq_len-output_len-1):]
         else:
             line_encoded = line_encoded[:, -768:]
         line_encoded = line_encoded.type(torch.int32)
@@ -216,36 +287,86 @@ def main():
         output_lines = ".".join(output_lines.split('.')[:4]) + "."
         return output_lines, tokens
 
-    def summarize_ft_sep(datapoint):
+    def summarize_ft_sep(datapoint, data_idx):
+        def process_input_text(text):
+            return text.strip().replace(" n't", "n't")
         if summarize:
-            line = datapoint['article'] + ' TL;DR: '
+            lines = [process_input_text(line + ' TL;DR: ') for line in datapoint['article']]
         else:
-            line = datapoint['article']
-        line = line.strip()
-        line = line.replace(" n't", "n't")
-
-        line_encoded = tokenizer.encode(line, return_tensors='pt')
-        if summarize:
-            line_encoded = line_encoded[:, -923:]
-        else:
-            line_encoded = line_encoded[:, -768:]
+            lines = [process_input_text(line) for line in datapoint['article']]
+        tokenizer_input = tokenizer(lines, return_tensors='pt', padding=True)
+        line_encoded = tokenizer_input['input_ids']
+        input_lengths = tokenizer_input['attention_mask'].sum(1)
+        
+        if line_encoded.shape[1] > max_seq_len-output_len-1:
+            for idx, input_length in enumerate(input_lengths):
+                if input_length > max_seq_len-output_len-1:
+                    cur_start_idx = input_length.item()-(max_seq_len-output_len-1)
+                    line_encoded[idx][:(max_seq_len-output_len-1)] = line_encoded[idx][cur_start_idx:input_length.item()].clone()
+                    input_lengths[idx] = max_seq_len-output_len-1
+            line_encoded = line_encoded[:,:(max_seq_len-output_len-1)].contiguous()
         line_encoded = line_encoded.type(torch.int32).to(gpt.device)
-        input_lengths = torch.tensor([len(line_encoded[0])], dtype=torch.int32, device=gpt.device)
-
+        input_lengths = input_lengths.type(torch.int32).to(gpt.device)
         with torch.no_grad():
-            output_dict = gpt.generate(input_token_ids=line_encoded,
+            profiler.start('ft')
+            if args.method == "baseline":
+                output_dict = gpt.generate(input_token_ids=line_encoded,
+                                        input_lengths=input_lengths,
+                                        gen_length=output_len,
+                                        eos_token_id=tokenizer.eos_token_id,
+                                        return_output_length=True,
+                                        **infer_decode_args)
+            elif "LLMA" in args.method:
+                output_dict = gpt_LLMA(gpt, check_length=args.check_length, copy_length=args.copy_length, vocab_size=50272,
+                                    input_token_ids=line_encoded,
                                        input_lengths=input_lengths,
                                        gen_length=output_len,
                                        eos_token_id=tokenizer.eos_token_id,
                                        return_output_length=True,
                                        **infer_decode_args)
-
+            elif "SD" in args.method:
+                output_dict = gpt_speculative_decoding(gpt, draft_gpt, draft_steps_max,
+                                        vocab_size,
+                                        input_token_ids=line_encoded,
+                                        input_lengths=input_lengths,
+                                        gen_length=output_len,
+                                        eos_token_id=tokenizer.eos_token_id,
+                                        return_output_length=True,
+                                        **infer_decode_args)
+            profiler.stop('ft')
         output_token_ids = output_dict['output_token_ids']
         output_lengths = output_dict['output_lengths']
-        tokens = output_token_ids[0, 0, input_lengths[0]:output_lengths[0]]
-        output_lines = tokenizer.decode(tokens)
-        output_lines = ".".join(output_lines.split('.')[:4]) + "."
-        return output_lines, tokens.cpu().numpy()
+        batch_input_lines = []
+        batch_output_lines = []
+        batch_tokens = []
+        for idx in range(output_token_ids.shape[0]):
+            tokens = output_token_ids[idx, 0, :output_lengths[idx]]
+
+            output_lines = tokenizer.decode(tokens[input_lengths[idx]:])
+            output_lines = ".".join(output_lines.split('.')[:4]) + "."
+            batch_output_lines.append(output_lines)
+            batch_tokens.append(tokens[input_lengths[idx]:].cpu().tolist())
+
+            input_lines = tokenizer.decode(tokens[:input_lengths[idx]])
+            batch_input_lines.append(input_lines)
+        
+        # write results
+        if rank == 0 and data_idx is not None: 
+            stat_dict = {
+                "wall_time": output_dict['wall_time'],
+                "new_tokens": (output_lengths-input_lengths).cpu().tolist(),
+                "inference_steps": output_dict['inference_steps'].cpu().tolist(),
+                # "input_text": batch_input_lines,
+                "output_text": batch_output_lines,
+                "output_tokens": batch_tokens,
+                "data_idx": data_idx,
+                "input_lengths": input_lengths.cpu().tolist(),
+                "pad_tokens": output_dict['pad_tokens']
+            }
+            json.dump(stat_dict, f, ensure_ascii=False)
+            f.write("\n")
+        
+        return batch_output_lines, batch_tokens
 
     summarize_ft = summarize_ft_e2e if not args.use_gpt_decoder_ops else summarize_ft_sep
 
@@ -258,10 +379,7 @@ def main():
         line = line.replace(" n't", "n't")
 
         line_encoded = tokenizer.encode(line, return_tensors='pt')
-        if summarize:
-            line_encoded = line_encoded[:, -923:]
-        else:
-            line_encoded = line_encoded[:, -768:]
+        line_encoded = line_encoded[:,:(max_seq_len-output_len-1)].contiguous()
         # line_encoded = line_encoded.to(device_hf)
         line_encoded = line_encoded.cuda()
 
@@ -277,62 +395,69 @@ def main():
         output_lines = tokenizer.decode(output[0][len(line_encoded[0]):])
         output_lines = ".".join(output_lines.split('.')[:4]) + "."
         return output_lines, tokens
-
+    # warm up 
     if summarize:
-        datapoint = dataset_cnn['test'][0]
-        summary, _ = summarize_ft(datapoint)
-        print('---------------------------------------------------------')
-        print('FT Generated : ')
-        print(' Article : ', datapoint['article'])
-        print('\n Highlights : ', datapoint['highlights'])
-        print('\n Summary : ', summary)
-        print('---------------------------------------------------------')
-
-        if test_hf:
-            summary, _ = summarize_hf(datapoint)
+        datapoint = dataset_cnn['test'][:args.max_batch_size]
+        summary, _ = summarize_ft(datapoint, None)
+        if rank == 0:
             print('---------------------------------------------------------')
-            print('HF Generated : ')
+            print('FT Generated : ')
             print(' Article : ', datapoint['article'])
             print('\n Highlights : ', datapoint['highlights'])
             print('\n Summary : ', summary)
             print('---------------------------------------------------------')
 
+        if test_hf:
+            summary, _ = summarize_hf(dataset_cnn['test'][0])
+            if rank == 0:
+                print('---------------------------------------------------------')
+                print('HF Generated : ')
+                print(' Article : ', datapoint['article'][0])
+                print('\n Highlights : ', datapoint['highlights'][0])
+                print('\n Summary : ', summary)
+                print('---------------------------------------------------------')
+
     if summarize:
-        metric_ft = load_metric("rouge")
-        metric_hf = load_metric("rouge")
+        metric_ft = load_metric("../datasets/rouge.py")
+        metric_hf = load_metric("../datasets/rouge.py")
     else:
         tokens = []
 
     ft_time = 0.0
     hf_time = 0.0
-    for data_point_idx in tqdm(range(1, 11490, int(11490 / args.max_ite))):
-        try:
-            datapoint = dataset_cnn['test'][data_point_idx]
+    selected_ids = pd.read_csv("../datasets/cnn_daiymail_selected_ids.csv", header=None)[0].tolist()
+    assert len(selected_ids) >= args.num_samples
+    for data_point_idx in trange(0, args.num_samples+1-args.max_batch_size, args.max_batch_size):
+        if 1:
+            datapoint = dataset_cnn['test'][selected_ids[data_point_idx:data_point_idx+args.max_batch_size]]
 
             start_time = datetime.now()
-            summary_ft, tokens_ft = summarize_ft(datapoint)
+            summary_ft, tokens_ft = summarize_ft(datapoint, selected_ids[data_point_idx:data_point_idx+args.max_batch_size])
             stop_time = datetime.now()
             ft_time += (stop_time - start_time).total_seconds()
             if (test_hf and summarize) or not summarize:
-                start_time = datetime.now()
-                summary_hf, tokens_hf = summarize_hf(datapoint)
-                stop_time = datetime.now()
-                hf_time += (stop_time - start_time).total_seconds()
+                summary_hf_list = []
+                for idx in range(data_point_idx, data_point_idx+args.max_batch_size):
+                    start_time = datetime.now()
+                    summary_hf, tokens_hf = summarize_hf(dataset_cnn['test'][idx])
+                    stop_time = datetime.now()
+                    hf_time += (stop_time - start_time).total_seconds()
+                    summary_hf_list.append(summary_hf)
 
             if rank == 0:
                 if summarize:
-                    metric_ft.add_batch(predictions=[summary_ft], references=[datapoint['highlights']])
+                    metric_ft.add_batch(predictions=summary_ft, references=datapoint['highlights'])
                     if test_hf:
-                        metric_hf.add_batch(predictions=[summary_hf], references=[datapoint['highlights']])
+                        metric_hf.add_batch(predictions=summary_hf_list, references=datapoint['highlights'])
                 else:
                     tokens.append((tokens_ft, tokens_hf))
                 if args.verbose:
                     print('-' * 100)
                     print('FT Summary:', summary_ft)
                     if test_hf:
-                        print('HF Summary:', summary_hf)
-        except:
-            print('Error with datapoint : ', data_point_idx)
+                        print('HF Summary:', summary_hf_list)
+        # except:
+        #     print('Error with datapoint : ', data_point_idx)
 
     def compute_exact_match(tokens, n_tokens=[1, 10, 25, 50, 100, 150, 200, 250]):
         em_metrics = []
@@ -372,6 +497,7 @@ def main():
                 print(f"[INFO] TEST PASS !")
         else:
             em_metrics = compute_exact_match(tokens)
+        profiler.summary()
 
 
 if __name__ == '__main__':

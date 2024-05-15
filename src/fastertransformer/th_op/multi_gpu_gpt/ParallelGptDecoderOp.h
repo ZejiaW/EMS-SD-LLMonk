@@ -39,7 +39,9 @@ public:
                          th::Tensor&              key_cache,
                          th::Tensor&              value_cache,
                          th::optional<th::Tensor> cache_indirection,
-                         th::optional<th::Tensor> linear_bias_slopes) = 0;
+                         th::optional<th::Tensor> linear_bias_slopes,
+                         th::optional<th::Tensor> token_nums_per_sample,
+                         const int64_t            token_nums_per_sample_max) = 0;
 };
 
 template<typename T>
@@ -72,7 +74,9 @@ public:
                  th::Tensor&              key_cache,
                  th::Tensor&              value_cache,
                  th::optional<th::Tensor> cache_indirection,
-                 th::optional<th::Tensor> linear_bias_slopes) override;
+                 th::optional<th::Tensor> linear_bias_slopes,
+                 th::optional<th::Tensor> token_nums_per_sample,
+                 const int64_t            token_nums_per_sample_max) override;
 
 private:
     const size_t num_heads_;
@@ -130,7 +134,9 @@ public:
                                     th::Tensor               key_cache,
                                     th::Tensor               value_cache,
                                     th::optional<th::Tensor> cache_indirection_opt,
-                                    th::optional<th::Tensor> linear_bias_slopes_opt);
+                                    th::optional<th::Tensor> linear_bias_slopes_opt,
+                                    th::optional<th::Tensor> token_nums_per_sample,
+                                    const int64_t            token_nums_per_sample_max);
 
 private:
     at::ScalarType          scalar_type_;

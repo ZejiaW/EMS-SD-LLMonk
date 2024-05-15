@@ -17,6 +17,10 @@ import dataclasses
 import os
 import pathlib
 import typing
+try:
+    from typing import Literal # py 3.8 or later
+except ImportError:
+    from typing_extensions import Literal
 
 import numpy as np
 import torch
@@ -450,7 +454,7 @@ class GPT(nn.Module):
                  inter_size: int = 0,
                  # gpt_variant_params
                  layernorm_eps: float = 1e-6,
-                 layernorm_type: typing.Literal['pre_layernorm', 'post_layernorm'] = "pre_layernorm",
+                 layernorm_type: Literal['pre_layernorm', 'post_layernorm'] = "pre_layernorm",
                  activation_type: str = "Gelu",
                  gpt_with_moe: bool = False,
                  expert_num: int = 0,
@@ -662,7 +666,7 @@ class GptInitModelParameters:
     sparse: int
     # GPT variant params.
     layernorm_eps: float = 1e-6
-    layernorm_type: typing.Literal['pre_layernorm', 'post_layernorm'] = 'pre_layernorm'
+    layernorm_type: Literal['pre_layernorm', 'post_layernorm'] = 'pre_layernorm'
     activation_type: str = 'gelu'
     has_positional_encoding: bool = True
     has_pre_decoder_layernorm: bool = False
