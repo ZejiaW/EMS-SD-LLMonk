@@ -211,7 +211,7 @@ def gpt_speculative_decoding(
                             step=0,
                             ite=ite,
                             input_embeds=input_embeds,
-                            sequence_lengths=sequence_lengths[bbidx]-all_accept[bbidx] if (draft_step ==0 and all_accept.sum()>0) else sequence_lengths[bbidx]+draft_step,
+                            sequence_lengths=sequence_lengths[bbidx]-1 if (draft_step ==0 and all_accept.sum()>0) else sequence_lengths[bbidx]+draft_step,
                             key_cache=draft_k_cache,
                             value_cache=draft_v_cache,
                             finished=finished[bbidx],
