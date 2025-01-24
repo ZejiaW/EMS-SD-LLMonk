@@ -1,5 +1,7 @@
 # EMS-SD: Efficient Multi-sample Speculative Decoding for Accelerating Large Language Models
 
+Accepted by NAACL 2025 main conference!!
+
 arxiv preprint: https://arxiv.org/abs/2405.07542
 
 ## Abstract
