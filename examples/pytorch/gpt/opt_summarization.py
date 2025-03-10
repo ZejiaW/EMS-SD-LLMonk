@@ -125,15 +125,30 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(hf_model_name, use_fast=False)
     tokenizer.pad_token = tokenizer.eos_token
-    dataset_cnn = load_from_disk("../datasets/cnn_dailymail/")
+
+    if not os.path.exists("../datasets/cnn_dailymail/"):
+        dataset_cnn = load_dataset("cnn_dailymail", "3.0.0")
+        dataset_cnn.save_to_disk("../datasets/cnn_dailymail/")
+    else:
+        dataset_cnn = load_from_disk("../datasets/cnn_dailymail/")
 
     hf_config = vars(AutoConfig.from_pretrained(hf_model_name))
 
+
     head_num = hf_config['num_attention_heads']
+    hidden_size = hf_config['hidden_size']
     layer_num = hf_config['num_hidden_layers']
     start_id = hf_config['bos_token_id']
     end_id = hf_config['eos_token_id']
     size_per_head = hf_config['hidden_size'] // head_num
+
+    if rank == 0:
+        print(f"\n=== CONFIG DEBUG ===", flush=True)
+        print(f"Model path: {hf_model_name}", flush=True)
+        print(f"num_attention_heads: {hf_config['num_attention_heads']}", flush=True)
+        print(f"hidden_size: {hf_config['hidden_size']}", flush=True)
+        print(f"size_per_head: {hf_config['hidden_size'] // hf_config['num_attention_heads']}", flush=True)
+        print(f"max_position_embeddings: {hf_config['max_position_embeddings']}\n", flush=True)
 
     # opt specific params: some are fixed
     layernorm_eps = 1e-5
@@ -499,6 +514,9 @@ def main():
             em_metrics = compute_exact_match(tokens)
         profiler.summary()
 
+    if rank == 0:
+        sys.stdout.flush()
+        sys.stderr.flush()
 
 if __name__ == '__main__':
     main()

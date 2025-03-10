@@ -16,3 +16,6 @@ __pycache__/
 
 /3rdparty/NeMo/
 /3rdparty/apex/
+
+/outputs/
+/datasets/
