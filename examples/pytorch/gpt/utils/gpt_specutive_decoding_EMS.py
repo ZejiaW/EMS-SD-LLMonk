@@ -220,6 +220,14 @@ def gpt_speculative_decoding(
                             masked_tokens=masked_tokens[bbidx, ...],
                             token_nums_per_sample=token_nums_per_sample)
 
+                        # print("================================================")
+                        # if torch.isnan(hidden_states).any():
+                        #     print(hidden_states, hidden_states.shape)
+                        #     print(input_embeds, input_embeds.shape, torch.sum(torch.isnan(input_embeds)))
+                        #     print(input_tokens, input_tokens.shape)
+                        # print("================================================")
+
+
                         if draft_step ==0 and all_accept.sum()>0:
                             hidden_states = hidden_states.reshape(batch_size, 2, -1)
                             hidden_states = hidden_states[:,-1,:]
@@ -233,10 +241,61 @@ def gpt_speculative_decoding(
                             logits = torch.nn.functional.linear(hidden_states.float(), draft_gpt.lm_head.weight)[:,:vocab_size]
                         else:
                             logits = draft_gpt.lm_head(hidden_states).float()[:,:vocab_size]
+                        
+                        if torch.isnan(logits).any():
+                            print("!!! logits is nan")
+                            exit(0)
                         predict_tokens = logits.argmax(-1).type(torch.int32)
-                        output_token_ids[draft_sequence_lengths_cpu+1, bbidx] = predict_tokens
+
+                        # ============================================================
+                        # Get previously generated tokens
+                        # prev_tokens = output_token_ids[:sequence_lengths[bbidx], bbidx]
+                        # batch_indices = []
+                        # for i, idx in enumerate(bbidx):
+                        #     seq_len = sequence_lengths[idx].item()
+                        #     batch_indices.append(output_token_ids[:seq_len, idx])
+
+                        # prev_tokens = torch.cat(batch_indices, dim=0)
+                        
+                        # # Apply penalty to repeated tokens
+                        # print("before penalty", logits[0, 0], logits[1, 0], repetition_penalty, logits.shape, repetition_penalty.shape)
+                        # if torch.isnan(logits).any():
+                        #     print(hidden_states, hidden_states.shape)
+                        # for token in prev_tokens.unique():
+                        #     logits[bbidx, token] /= repetition_penalty[bbidx].to(logits.device)  # Scale down repeated tokens
+                        # print("after penalty", logits[0, 0], logits[1, 0])
+                        
+                        # # Apply temperature and sampling
+                        # # print("draft logits shape", logits.shape)
+                        # # print("draft temperature shape", temperature.shape)
+                        # if temperature.dim() == 1:
+                        #     temperature = temperature.unsqueeze(-1).to(logits.device)
+                        # print(temperature.shape, logits.shape, logits[1, 0])
+                        # logits = logits / temperature
+                        # # find where the logits is inf or nan
+                        # inf_mask = torch.isinf(logits)
+                        # nan_mask = torch.isnan(logits)
+                        # print(torch.where(inf_mask))
+                        # print(torch.where(nan_mask))
+                        # probs = torch.softmax(logits, dim=-1)
+                        # probs = probs.view(-1, probs.size(-1))  # Ensure 2D shape [batch*steps, vocab]
+                        # predict_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                        # predict_tokens = predict_tokens.view(batch_size, -1).squeeze(-1)
+                        # print("================================================")
+                        # if torch.isnan(predict_tokens).any():
+                        #     print(predict_tokens, predict_tokens.shape)
+                        # print("================================================")
+                        # ============================================================
+
+                        output_token_ids[draft_sequence_lengths_cpu+1, bbidx] = predict_tokens.type(torch.int32)
                         draft_sequence_lengths_cpu += 1
 
+                        # ============================================================
+                        # eos_mask = (predict_tokens == eos_token_id)
+                        # finished[bbidx] = finished[bbidx] | eos_mask
+                        # if eos_mask.any():
+                        #     break  # Stop drafting if any sample hits EOS
+                        # ============================================================
                     profiler.stop('ft-decoder-draft')
                     
                     profiler.start('ft-decoder-prepare')
@@ -295,6 +354,39 @@ def gpt_speculative_decoding(
                     logits = torch.nn.functional.linear(hidden_states.float(), gpt.lm_head.weight)
                 else:
                     logits = gpt.lm_head(hidden_states).float()
+
+                # print(logits.shape)
+                # ============================================================
+                # for idx in range(batch_size):
+                #     prev_tokens = output_token_ids[:sequence_lengths[idx], idx]
+                #     for token in prev_tokens.unique():
+                #         logits[idx, token] /= repetition_penalty[idx]
+
+                # # print(temperature.shape, top_p.shape)
+                # logits = logits / temperature[0].item() * torch.ones_like(logits, device=logits.device)
+                # # print(logits.shape)
+                # if (top_p > 0).any():  # Check if any elements need top-p filtering
+                #     # Apply nucleus sampling per sample
+                #     for i in range(batch_size):
+                #         if top_p[i] > 0:
+                #             sorted_logits, sorted_indices = torch.sort(logits[i], descending=True)
+                #             cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                #             sorted_indices_to_remove = cumulative_probs > top_p[i]
+                #             sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
+                #             sorted_indices_to_remove[0] = False
+                #             indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
+                #             logits[i][indices_to_remove] = -float('Inf')
+                #             if torch.all(indices_to_remove):
+                #                 logits[i][0] = 0  # Force at least one valid token
+
+                # probs = torch.softmax(logits.float(), dim=-1) + 1e-8
+                # probs = probs / probs.sum(dim=-1, keepdim=True)  # Renormalize
+                # profiler.start('ft-decoder-post-process')
+                # probs = probs.view(-1, probs.size(-1))  # Ensure 2D shape [batch*steps, vocab]
+                # predict_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                # predict_tokens = predict_tokens.flatten()
+                # print(predict_tokens.shape)
+                # ============================================================
                 
                 profiler.start('ft-decoder-post-process')
                 predict_tokens = logits[:,:vocab_size].argmax(-1).type(torch.int32)

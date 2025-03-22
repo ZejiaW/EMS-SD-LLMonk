@@ -19,3 +19,5 @@ __pycache__/
 
 /outputs/
 /datasets/
+
+/llmonk.egg-info/

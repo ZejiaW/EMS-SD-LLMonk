@@ -1,5 +1,15 @@
 #!/bin/bash
 
+# conda init
+
+# conda create -n llmonk python=3.11.8 -y
+
+# conda activate llmonk
+
+pip install --upgrade pip
+
+# pip install -r requirements.txt
+
 pip install -r ./examples/pytorch/gpt/requirement.txt
 
 python -m pip install mpi4py
