@@ -1,4 +1,4 @@
-# A Multi-Sample Speculative-DEcoding-Based LLM Reasoning System 
+# A Multi-Sample Speculative-Decoding-Based LLM Reasoning System 
 
 An LLM reasoning system combining EMS-SD for multi-sample speculative decoding and LLMonk for multi-sample reasoning.
 
